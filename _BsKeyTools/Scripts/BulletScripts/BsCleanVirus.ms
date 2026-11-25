@@ -6,7 +6,7 @@
  * @LastEditTime: 2026-02-09 18:30:48
  * @Email: animator.bullet@foxmail.com
  */
-global curVerBsCleanVirus = "2.3"
+global curVerBsCleanVirus = "2.4.1"
 global rolBsCleanVirus
 global rolBsVirusScanLog
 global rolBatchCleanVirus
@@ -23,9 +23,6 @@ try(FileIn ((getDir #scripts) + "\\BulletScripts\\fnSaveLoadConfig.ms"))
 catch(messagebox "打开失败，工具可能安装不完全，\r\n\r\n建议查看设置中的帮助或重新安装...                            " beep:false)
 try(FileIn ((getDir #scripts) + "\\BulletScripts\\fnGetColorTheme.ms"))
 catch(messagebox "打开失败，工具可能安装不完全，\r\n\r\n建议查看设置中的帮助或重新安装...                            " beep:false)
--- 自启守护（开启时加载即生效；杀毒自启未开时，打开本工具也能补上防护）
-try(FileIn ((getDir #scripts) + "\\BulletScripts\\fnStartupGuard.ms"))
-catch(format "[BsCleanVirus] 加载自启守护失败(fnStartupGuard.ms): %\n" (getCurrentException()))
 stLoadConfigAll.fnLoadConfigBsCleanVirus ()
 
 rollout rolBsVirusScanLog "病毒扫描日志  【杀毒不会破坏源文件，请注意杀毒后保存/另存文件！】" (
@@ -482,6 +479,193 @@ rollout rolBsVirusScanLog "病毒扫描日志  【杀毒不会破坏源文件，
 	on btnExportLog pressed do exportLog()
 )
 
+-- The official engine checks files during load/save; capture its counts before loading.
+fn BsVirusOfficialCounts =
+(
+    if (getIniSetting (getMAXIniFile()) "SecurityTools" "LoadSecurityTools") == "0" do
+        throw "官方场景安全防护已关闭，请先在首选项的安全页面开启。"
+    local counts = try (#(SecurityTools.GetProblemFoundCount(), SecurityTools.GetProblemFixedCount())) catch(undefined)
+    if counts==undefined do throw "无法读取官方查杀结果，请安装支持当前 Max 的 Scene Security Tools。"
+    counts
+)
+
+fn BsVirusThreatRecords slog =
+(
+    for row in (slog.get type:#threat) collect (row[1] + "\t" + row[3])
+)
+
+fn BsVirusOfficialDelta before after =
+(
+    if after[1]<before[1] or after[2]<before[2] do
+        throw "官方检测计数发生重置，本文件结果无法确认，请重新开始批量查杀。"
+    #(after[1]-before[1], after[2]-before[2])
+)
+
+struct BsVirusBatchEntry (filePath, state=#pending, threatCount=0, saved=false, stamp="")
+dotNet.loadAssembly "System.Xml"
+struct BsVirusBatchProgress
+(
+    statePath, entries=#(), autoSave=false, recursive=false, activeFile="",
+
+    fn pathKey value = (toLower ((dotNetClass "System.IO.Path").GetFullPath value)),
+    fn fileStamp value =
+    (
+        try
+        (
+            local info=dotNetObject "System.IO.FileInfo" value
+            if info.Exists then (info.Length as string)+":"+(info.LastWriteTimeUtc.ToString "O") else ""
+        ) catch ("")
+    ),
+    fn isComplete entry =
+    (
+        entry.saved and (findItem #(#clean,#cleaned) entry.state)>0 and entry.stamp!="" and
+        (fileStamp entry.filePath)==entry.stamp and
+        (activeFile=="" or (pathKey activeFile)!=(pathKey entry.filePath))
+    ),
+    fn completedCount = (for entry in entries where entry.saved collect entry).count,
+
+    fn readState filePath =
+    (
+        local settings=dotNetObject "System.Xml.XmlReaderSettings"
+        settings.DtdProcessing=(dotNetClass "System.Xml.DtdProcessing").Prohibit
+        local reader=(dotNetClass "System.Xml.XmlReader").Create filePath settings
+        local doc=dotNetObject "System.Xml.XmlDocument"
+        local failure=undefined
+        try (doc.Load reader) catch (failure=getCurrentException())
+        reader.Close()
+        if failure!=undefined do throw failure
+        local root=doc.DocumentElement
+        if root.Name!="BsCleanVirusBatch" or (root.GetAttribute "format")!="1" do throw "断点记录格式不正确。"
+        local rows=#()
+        local storedVersion=root.GetAttribute "tool"
+        local sameTool=storedVersion==curVerBsCleanVirus or (curVerBsCleanVirus=="2.4.1" and storedVersion=="2.4")
+        local nodes=root.SelectNodes "File"
+        if nodes.Count>0 do for nodeIndex=0 to nodes.Count-1 do
+        (
+            local node=nodes.Item nodeIndex
+            local file=node.GetAttribute "path"
+            if file=="" do throw "断点记录缺少文件路径。"
+            local state=case (node.GetAttribute "state") of
+            (
+                "pending": #pending
+                "clean": #clean
+                "cleaned": #cleaned
+                "unsaved": #unsaved
+                "error": #error
+                default: undefined
+            )
+            local threats=try ((node.GetAttribute "threats") as integer) catch (-1)
+            if state==undefined or threats<0 do throw "断点记录包含无效的处理结果。"
+            append rows (BsVirusBatchEntry filePath:((dotNetClass "System.IO.Path").GetFullPath file) state:state threatCount:threats saved:(sameTool and (node.GetAttribute "saved")=="1") stamp:(node.GetAttribute "stamp"))
+        )
+        #(rows, (root.GetAttribute "autoSave")=="1", (root.GetAttribute "recursive")=="1", root.GetAttribute "active")
+    ),
+    fn load =
+    (
+        local data=undefined, existed=false
+        for candidate in #(statePath,statePath+".bak") do
+        (
+            if data==undefined and doesFileExist candidate do
+            (
+                existed=true
+                data=try (readState candidate) catch (undefined)
+            )
+        )
+        if data==undefined then
+        (
+            if existed do throw "断点记录及备份无法读取，请先清空列表再建立新任务。"
+            false
+        )
+        else
+        (
+            entries=data[1]; autoSave=data[2]; recursive=data[3]; activeFile=data[4]
+            for entry in entries where not (isComplete entry) do
+            (
+                entry.saved=false
+                if (findItem #(#clean,#cleaned) entry.state)>0 do (entry.state=#pending; entry.threatCount=0)
+            )
+            true
+        )
+    ),
+    fn save =
+    (
+        local doc=dotNetObject "System.Xml.XmlDocument"
+        local root=doc.CreateElement "BsCleanVirusBatch"
+        doc.AppendChild root
+        root.SetAttribute "format" "1"
+        root.SetAttribute "tool" curVerBsCleanVirus
+        root.SetAttribute "autoSave" (if autoSave then "1" else "0")
+        root.SetAttribute "recursive" (if recursive then "1" else "0")
+        root.SetAttribute "active" activeFile
+        for entry in entries do
+        (
+            local node=doc.CreateElement "File"
+            node.SetAttribute "path" entry.filePath
+            node.SetAttribute "state" (entry.state as string)
+            node.SetAttribute "threats" (entry.threatCount as string)
+            node.SetAttribute "saved" (if entry.saved then "1" else "0")
+            node.SetAttribute "stamp" entry.stamp
+            root.AppendChild node
+        )
+        (dotNetClass "System.IO.Directory").CreateDirectory (getFilenamePath statePath)
+        local temp=statePath+"."+((dotNetClass "System.Guid").NewGuid()).ToString("N")+".tmp"
+        local failure=undefined
+        try
+        (
+            doc.Save temp
+            if doesFileExist statePath then
+                (dotNetClass "System.IO.File").Replace temp statePath (statePath+".bak")
+            else
+                (dotNetClass "System.IO.File").Move temp statePath
+        ) catch (failure=getCurrentException())
+        if failure!=undefined do
+        (
+            try ((dotNetClass "System.IO.File").Delete temp) catch ()
+            throw ("无法保存断点，已停止继续处理：\n"+failure)
+        )
+        true
+    ),
+    fn prepare files saveFiles includeChildren =
+    (
+        load()
+        local oldKeys=for entry in entries collect (pathKey entry.filePath)
+        local rows=#(), keys=#()
+        for file in files do
+        (
+            local key=pathKey file
+            if (findItem keys key)==0 do
+            (
+                local index=findItem oldKeys key
+                append rows (if index>0 then entries[index] else BsVirusBatchEntry filePath:((dotNetClass "System.IO.Path").GetFullPath file))
+                append keys key
+            )
+        )
+        entries=rows; autoSave=saveFiles; recursive=includeChildren; activeFile=""
+        save()
+        for entry in entries collect entry.filePath
+    ),
+    fn beginFile index =
+    (
+        activeFile=entries[index].filePath
+        entries[index].saved=false
+        entries[index].state=#pending
+        entries[index].threatCount=0
+        save()
+    ),
+    fn finishFile index result =
+    (
+        local entry=entries[index]
+        entry.state=result[1]; entry.threatCount=result[2]
+        entry.saved=autoSave and (findItem #(#clean,#cleaned) entry.state)>0
+        entry.stamp=if entry.saved then fileStamp entry.filePath else ""
+        if entry.saved and entry.stamp=="" do throw "无法确认已保存文件的状态，未记录为完成。"
+        activeFile=""
+        save()
+    ),
+    fn clear = (entries=#(); activeFile=""; save())
+)
+
+
 rollout rolBatchCleanVirus "批量查杀病毒" (
 	-- 待扫描文件列表
 	label lblFileList "待扫描文件列表：" pos:[10, 10]
@@ -490,7 +674,7 @@ rollout rolBatchCleanVirus "批量查杀病毒" (
 	-- 操作按钮行
 	button btnAddFiles "添加文件" width: 85 height: 25 pos: [10, 200]
 	button btnAddFolder "添加文件夹" width: 90 height: 25 pos: [100, 200]
-	button btnClearList "清空列表" width: 80 height: 25 pos: [195, 200]
+	button btnClearList "清空列表" width: 80 height: 25 pos: [195, 200] toolTip:"清空文件列表和断点，从头开始；不会删除模型文件。"
 	checkbox chkRecursive "扫描子文件夹" pos: [290, 203] checked: false
 	checkbox chkAutoSave "查杀后立即保存" pos: [410, 203] checked: false
 	
@@ -504,11 +688,12 @@ rollout rolBatchCleanVirus "批量查杀病毒" (
 	dotNetControl lbxReport "system.windows.forms.listView" height: 130 width: 620 pos: [10, 335]
 	
 	-- 底部控制按钮
-	button btnStart "开始查杀" width: 100 height: 30 pos: [10, 475]
+	button btnStart "开始 / 继续" width: 100 height: 30 pos: [10, 475] toolTip:"继续上次任务；已成功保存且未变化的文件会跳过。"
 	button btnStop "停止" width: 100 height: 30 pos: [115, 475] enabled: false
 	
 	local fileList = #()
 	local scanResults = #()
+	local checkpoint = undefined
 	
 	fn getDotNetColor r g b = (DotNetClass "System.Drawing.Color").fromargb r g b
 	
@@ -560,18 +745,26 @@ rollout rolBatchCleanVirus "批量查杀病毒" (
 	)
 	
 	fn updateFileList = (
-		lbxFiles.Items.Clear()
-		local idx = 1
-		
-		-- 只显示文件
-		for f in fileList do (
-			li = dotNetObject "System.Windows.Forms.ListViewItem" (idx as string)
-			li.subitems.add f
-			lbxFiles.Items.add li
-			idx += 1
+		local failure = undefined
+		lbxFiles.BeginUpdate()
+		try
+		(
+			lbxFiles.Items.Clear()
+			local idx = 1
+			for f in fileList do
+			(
+				li = dotNetObject "System.Windows.Forms.ListViewItem" (idx as string)
+				li.subitems.add f
+				lbxFiles.Items.add li
+				idx += 1
+			)
 		)
+		catch (failure = getCurrentException())
+		lbxFiles.EndUpdate()
+		if failure!=undefined do throw failure
 	)
 	
+
 	fn addFilesToList files = (
 		for f in files where (findItem fileList f) == 0 do (
 			append fileList f
@@ -613,6 +806,8 @@ rollout rolBatchCleanVirus "批量查杀病毒" (
 		statusText = case status of (
 			#clean: "✓ 干净"
 			#cleaned: "⚠ 已清理"
+			#unsaved: "⚠ 清理未保存"
+			#interrupted: "⏸ 中断待重试"
 			#error: "✗ 错误"
 			default: "未知"
 		)
@@ -629,6 +824,12 @@ rollout rolBatchCleanVirus "批量查杀病毒" (
 			#cleaned: (
 				fg = getDotNetColor 215 144 0
 			)
+			#unsaved: (
+				fg = getDotNetColor 215 144 0
+			)
+			#interrupted: (
+				fg = getDotNetColor 215 144 0
+			)
 			#error: (
 				fg = getDotNetColor 200 0 0
 			)
@@ -640,67 +841,92 @@ rollout rolBatchCleanVirus "批量查杀病毒" (
 		append scanResults #(filename, status, threatCount)
 	)
 	
-	fn scanFile filepath = 
+	fn scanFile filepath =
 	(
-		local threatCount = 0
-		local status = #clean
-		
-		try 
+		local threatCount = 0, status = #error
+		local oldQuiet = getQuietMode()
+		local slog = signature_log()
+		local oldVerbose = slog.getVerboseLevel()
+		local failure = undefined
+		try
 		(
-			-- 记录查杀前的日志数量
-			local slog = signature_log()
-			local beforeCount = (slog.getAll()).count
-			
-			-- 打开文件（兼容旧版本，不使用可选参数）
-			loadMaxFile filepath useFileUnits:true quiet:true
-			
-			-- 执行查杀
-			for f in getFiles (((getDir #scripts) + "\\BulletScripts\\ScanVirus\\")+ "signature.*.mcr") do 
+			local officialBefore = BsVirusOfficialCounts()
+			local beforeRecords = BsVirusThreatRecords slog
+			setQuietMode true
+			if (slog.setVerboseLevel 3)!=true do throw "无法启用批量静默查杀的日志设置。"
+			if not (loadMaxFile filepath useFileUnits:true quiet:true) do throw "文件打开失败，未执行查杀或保存。"
+			local mscCleaned = 0
+			for f in getFiles (((getDir #scripts) + "\\BulletScripts\\ScanVirus\\") + "signature.*.mcr") do
 			(
-				try(FileIn f) catch()
+				local ruleFailure = undefined
+				local ruleResult = try (fileIn f) catch (ruleFailure = getCurrentException(); false)
+				if ruleFailure!=undefined do throw ("查杀规则执行失败：" + (filenameFromPath f) + "\n" + ruleFailure)
+				if (getFilenameFile f)=="signature.worm.alienbrains" and ruleResult==true do mscCleaned+=1
 			)
-			
-			-- 记录查杀后的日志数量
-			local afterCount = (slog.getAll()).count
-			threatCount = afterCount - beforeCount
-			
-			if threatCount > 0 then 
+			local official = BsVirusOfficialDelta officialBefore (BsVirusOfficialCounts())
+			local newRecords = for record in (BsVirusThreatRecords slog) where (findItem beforeRecords record)==0 collect record
+			local signatureCount = amax newRecords.count mscCleaned
+			threatCount = official[1] + signatureCount
+			if official[2]<official[1] do throw "官方检测到的问题未全部清理，本文件未自动保存。"
+			-- Auto-save applies to every successfully checked file, including cleanup performed on load.
+			if chkAutoSave.checked do
 			(
-				status = #cleaned
-				
-				-- 如果勾选了自动保存（兼容旧版本）
-				if chkAutoSave.checked do 
-				(
-					try (
-						saveMaxFile filepath useNewFile:false quiet:true
-					) catch (
-						-- Fallback: 旧版本可能不支持这些参数
-						saveMaxFile filepath
-					)
-				)
-			) 
-			else 
-			(
-				status = #clean
-				-- 写入干净文件的日志（使用默认类型）
-				local msg = "批量查杀：" + (filenameFromPath filepath) + " - 未发现威胁"
-				slog.write msg
+				if not (saveMaxFile filepath useNewFile:false quiet:true) do throw "文件保存失败，磁盘上的原文件未确认已清理。"
+				local afterSave = BsVirusOfficialDelta officialBefore (BsVirusOfficialCounts())
+				if afterSave[2]<afterSave[1] do throw "保存时仍检测到未清理的问题，请查看官方安全日志。"
+				official = afterSave
+				threatCount = official[1] + signatureCount
 			)
-		) 
-		catch 
-		(
-			status = #error
-			threatCount = 0
-			-- 写入错误日志
-			local slog = signature_log()
-			local msg = "批量查杀：" + (filenameFromPath filepath) + " - 扫描失败"
-			try (
-				msg += "（" + (getCurrentException()) + "）"
-			) catch ()
-			slog.write msg type:#warn
+			status = if threatCount>0 then (if chkAutoSave.checked then #cleaned else #unsaved) else #clean
+			slog.write ("批量查杀：" + (filenameFromPath filepath) + " - 官方检测 " + (official[1] as string) +
+				"，官方修复 " + (official[2] as string) + "，特征检测 " + (signatureCount as string) +
+				(if chkAutoSave.checked then "；已保存" else "；未保存")) type:#default
 		)
-		
-		return #(status, threatCount)
+		catch (failure = getCurrentException(); status = #error)
+		setQuietMode oldQuiet
+		local restored = try (slog.setVerboseLevel oldVerbose) catch(false)
+		if restored!=true do (status = #error; if failure==undefined do failure = "无法恢复原来的查杀日志设置。")
+		if failure!=undefined do slog.write ("批量查杀：" + (filenameFromPath filepath) + " - " + failure) type:#warn
+		#(status, threatCount)
+	)
+	
+	fn restoreProgress =
+	(
+		if checkpoint.load() do
+		(
+			fileList = for entry in checkpoint.entries collect entry.filePath
+			chkAutoSave.checked = checkpoint.autoSave
+			chkRecursive.checked = checkpoint.recursive
+			updateFileList()
+			local failure = undefined
+			lbxReport.BeginUpdate()
+			try
+			(
+				lbxReport.Items.Clear()
+				scanResults = #()
+				for i=1 to checkpoint.entries.count do
+				(
+					local entry = checkpoint.entries[i]
+					if checkpoint.activeFile!="" and (checkpoint.pathKey entry.filePath)==(checkpoint.pathKey checkpoint.activeFile) then
+					(
+						updateReport entry.filePath #interrupted entry.threatCount
+						lbxFiles.Items.Item[i-1].Selected = true
+						lbxFiles.Items.Item[i-1].EnsureVisible()
+					)
+					else if entry.saved or (findItem #(#error,#unsaved) entry.state)>0 do
+						updateReport entry.filePath entry.state entry.threatCount
+				)
+			)
+			catch (failure = getCurrentException())
+			lbxReport.EndUpdate()
+			if failure!=undefined do throw failure
+			if fileList.count>0 do
+			(
+				lblStatus.text = "已恢复断点：已保存 " + (checkpoint.completedCount() as string) + "/" + (fileList.count as string) +
+					(if checkpoint.activeFile!="" then "；上次中断：" + filenameFromPath checkpoint.activeFile else "；点击开始 / 继续")
+				pbProgress.value = (100.0 * checkpoint.completedCount() / fileList.count) as integer
+			)
+		)
 	)
 	
 	fn startBatchScan = (
@@ -714,7 +940,7 @@ rollout rolBatchCleanVirus "批量查杀病毒" (
 		)
 		
 		-- 确认对话框
-		local confirmMsg = "批量查杀将打开并处理 " + (totalFiles as string) + " 个文件。\n\n"
+		local confirmMsg = "批量查杀列表共有 " + (totalFiles as string) + " 个文件。\n已保存且未变化的文件会跳过，仅打开待处理文件。\n\n"
 		confirmMsg += "⚠ 重要提示：\n"
 		confirmMsg += "1. 当前场景将被重置\n"
 		confirmMsg += "2. 请先保存当前文件！\n\n"
@@ -730,6 +956,20 @@ rollout rolBatchCleanVirus "批量查杀病毒" (
 			return undefined
 		)
 		
+		local batchFailure = undefined
+		try
+		(
+			allFiles = checkpoint.prepare allFiles chkAutoSave.checked chkRecursive.checked
+			fileList = allFiles
+			totalFiles = allFiles.count
+			updateFileList()
+		)
+		catch (batchFailure = getCurrentException())
+		if batchFailure!=undefined do
+		(
+			messageBox batchFailure title:"无法保存断点"
+			return undefined
+		)
 		-- 开始扫描
 		batchStopFlag = false
 		btnStart.enabled = false
@@ -740,38 +980,64 @@ rollout rolBatchCleanVirus "批量查杀病毒" (
 		chkRecursive.enabled = false
 		chkAutoSave.enabled = false
 		
-		-- 清空报告
-		lbxReport.Items.Clear()
-		scanResults = #()
-		
-		lblStatus.text = "准备扫描 " + (totalFiles as string) + " 个文件..."
-		pbProgress.value = 0
-		windows.processPostedMessages()
-		
-		-- 逐个扫描
-		for i = 1 to totalFiles while (not batchStopFlag) do (
-			local filepath = allFiles[i]
-			lblStatus.text = "正在处理 (" + (i as string) + "/" + (totalFiles as string) + "): " + (filenameFromPath filepath)
-			
-			local result = scanFile filepath
-			updateReport filepath result[1] result[2]
-			
-			pbProgress.value = (100.0 * i / totalFiles) as integer
+		local reused = 0
+		local pending = #()
+		local reportBuffered = false
+		try
+		(
+			lbxReport.BeginUpdate()
+			reportBuffered = true
+			lbxReport.Items.Clear()
+			scanResults = #()
+			-- prepare 已核对文件状态；合并显示旧结果，只把未完成项加入本轮。
+			for i = 1 to totalFiles do
+			(
+				local entry = checkpoint.entries[i]
+				if entry.saved then
+				(
+					reused += 1
+					updateReport entry.filePath entry.state entry.threatCount
+				)
+				else append pending i
+			)
+			lbxReport.EndUpdate()
+			reportBuffered = false
+			lblStatus.text = "已跳过 " + (reused as string) + " 个已完成文件；待处理 " + (pending.count as string) + " 个"
+			pbProgress.value = (100.0 * reused / totalFiles) as integer
 			windows.processPostedMessages()
+			for n = 1 to pending.count while (not batchStopFlag) do
+			(
+				local i = pending[n]
+				local filepath = allFiles[i]
+				lblStatus.text = "正在处理 (" + (n as string) + "/" + (pending.count as string) + ")，已跳过 " + (reused as string) + ": " + (filenameFromPath filepath)
+				checkpoint.beginFile i
+				local result = scanFile filepath
+				checkpoint.finishFile i result
+				updateReport filepath result[1] result[2]
+				pbProgress.value = (100.0 * (reused+n) / totalFiles) as integer
+				windows.processPostedMessages()
+			)
 		)
+
+		catch (batchFailure = getCurrentException(); batchStopFlag = true)
+		if reportBuffered do lbxReport.EndUpdate()
+		if batchFailure!=undefined do messageBox ("本轮已停止，可从已保存的断点继续。\n\n" + batchFailure) title:"批量任务中断"
 		
 		if batchStopFlag then (
-			lblStatus.text = "已停止！已处理 " + (scanResults.count as string) + "/" + (totalFiles as string) + " 个文件"
+			lblStatus.text = "已停止，断点已保留；已保存 " + (checkpoint.completedCount() as string) + "/" + (totalFiles as string) + " 个文件"
 		) else (
-			lblStatus.text = "完成！共处理 " + (totalFiles as string) + " 个文件"
+			lblStatus.text = "本轮完成；已保存 " + (checkpoint.completedCount() as string) + "/" + (totalFiles as string) + "；本次跳过 " + (reused as string)
 			local cleanCount = (for r in scanResults where r[2] == #clean collect r).count
 			local cleanedCount = (for r in scanResults where r[2] == #cleaned collect r).count
+			local unsavedCount = (for r in scanResults where r[2] == #unsaved collect r).count
 			local errorCount = (for r in scanResults where r[2] == #error collect r).count
 			
 			local summaryMsg = "批量查杀完成！\n\n"
-			summaryMsg += "共扫描: " + (totalFiles as string) + " 个文件\n"
+			summaryMsg += "共检查: " + (totalFiles as string) + " 个文件\n"
+			summaryMsg += "本次跳过已完成: " + (reused as string) + " 个\n"
 			summaryMsg += "✓ 干净: " + (cleanCount as string) + " 个\n"
 			summaryMsg += "⚠ 已清理: " + (cleanedCount as string) + " 个\n"
+			if unsavedCount > 0 do summaryMsg += "⚠ 清理未保存: " + (unsavedCount as string) + " 个\n"
 			if errorCount > 0 do (
 				summaryMsg += "✗ 错误: " + (errorCount as string) + " 个\n"
 			)
@@ -789,7 +1055,10 @@ rollout rolBatchCleanVirus "批量查杀病毒" (
 	)
 	
 	on rolBatchCleanVirus open do (
+		checkpoint = BsVirusBatchProgress statePath:(pathConfig.appendPath (getDir #maxData) "BsCleanVirusBatchProgress.xml")
 		initDotNet()
+		try (restoreProgress())
+		catch (lblStatus.text = "断点读取失败，可清空列表后重新建立任务。"; messageBox (getCurrentException()) title:"断点记录")
 	)
 	
 	on btnAddFiles pressed do (
@@ -836,9 +1105,19 @@ rollout rolBatchCleanVirus "批量查杀病毒" (
 	)
 	
 	on btnClearList pressed do (
-		fileList = #()
-		updateFileList()
-		lblStatus.text = "等待开始..."
+		try
+		(
+			checkpoint.autoSave = chkAutoSave.checked
+			checkpoint.recursive = chkRecursive.checked
+			checkpoint.clear()
+			fileList = #()
+			scanResults = #()
+			updateFileList()
+			lbxReport.Items.Clear()
+			pbProgress.value = 0
+			lblStatus.text = "列表和断点已清空，等待开始..."
+		)
+		catch (messageBox (getCurrentException()) title:"无法清空断点")
 	)
 	
 	on btnStart pressed do (
@@ -886,19 +1165,18 @@ rollout rolBsCleanVirus  ("BsCleanVirus_v" + curVerBsCleanVirus)
 		button btnCleanNow "立即查杀" width:70 height:30 pos:[185,20]
         button btnBatchClean "批量查杀" width:75 height:30 pos:[260,20]
         button btnCleanLog "日志" width:45 height:30 pos:[340,20]
-        checkbox chkStartupGuard "自启守护 [守护 Max“加载启动脚本”]" pos:[12,57] checked:true
     )
 
     group "杀毒特征库"
     (
-        listbox lbxVirusLib "" width:365 height:12 pos:[10,100] readonly:true
+        listbox lbxVirusLib "" width:365 height:12 pos:[10,75] readonly:true
     )
 
     HyperLink lnkPruneScene "杀毒特征来源：PruneScene" color:myfgColor hovercolor:myClickColor visitedcolor:myClickColor 
-        pos:[15,280] width:170 address:"http://3dground.net/manual/prune-scene#virus-active-protecton"
+        pos:[15,255] width:170 address:"http://3dground.net/manual/prune-scene#virus-active-protecton"
 
     HyperLink lnkBsNotion "解析修改：Bullet.S" color:myfgColor hovercolor:myClickColor visitedcolor:myClickColor 
-        pos:[260,280] width:120 address:"https://space.bilibili.com/2031113/lists/560782"
+        pos:[260,255] width:120 address:"https://space.bilibili.com/2031113/lists/560782"
 
     fn fnRefreshVirusLib =
     (
@@ -908,23 +1186,6 @@ rollout rolBsCleanVirus  ("BsCleanVirus_v" + curVerBsCleanVirus)
         lbxVirusLib.selection = 0
     )
 
-    -- 自启守护随杀毒自启脚本加载：主动防御关闭时守护不会随 Max 启动，置灰并注明
-    fn fnRefreshStartupGuardUI =
-    (
-        if fnBsStartupGuardIsEnabled == undefined then
-        (
-            chkStartupGuard.checked = false
-            chkStartupGuard.enabled = false
-            chkStartupGuard.text = "自启守护 [加载失败，请重新安装]"
-        )
-        else
-        (
-            chkStartupGuard.checked = fnBsStartupGuardIsEnabled()
-            chkStartupGuard.enabled = ckbStartup.state
-            chkStartupGuard.text = if ckbStartup.state then "自启守护 [守护 Max“加载启动脚本”]" else "自启守护 [需先开启主动防御]"
-        )
-    )
-
     on rolBsCleanVirus open do
     (
         stLoadConfigAll.fnLoadConfigBsCleanVirus()  ---------------脚本配置等赋值
@@ -932,7 +1193,6 @@ rollout rolBsCleanVirus  ("BsCleanVirus_v" + curVerBsCleanVirus)
 		iniVerboseLevel = stLoadConfigAll.fnGetVerboseLevel()
         ckbStartup.state = (SIOFile.Exists rolBsCleanVirus.startupLocalPath)
 		ckbSilent.state = if iniVerboseLevel == 1 then false else true
-        fnRefreshStartupGuardUI()
         fnRefreshVirusLib()
     )
 
@@ -998,31 +1258,7 @@ rollout rolBsCleanVirus  ("BsCleanVirus_v" + curVerBsCleanVirus)
             else (messagebox "已经开启自启，请勿重复操作！                                          ")
 		)
         stSetConfigAll.fnSetConfigBsCleanVirus ()
-        fnRefreshStartupGuardUI()
     )
-
-	on chkStartupGuard changed state do
-	(
-		if not (fnBsStartupGuardSetEnabled state) then
-		(
-			chkStartupGuard.checked = not state
-			messagebox ("保存自启守护设置失败，设置未改变！\r\n\r\n请检查配置文件是否只读或被占用：\r\n\r\n" + (fnBsStartupGuardConfigFile()) + "                    ") title:"自启守护"
-		)
-		else if state then
-		(
-			local regOk = fnBsStartupGuardRegister()
-			local iniOk = fnBsStartupGuardCheck #manual
-			local msg = "已开启自启守护！\r\n\r\n打开/合并/导入文件及退出 Max 时，若 Max 的“加载启动脚本”被病毒关闭，                    \r\n\r\n会自动恢复并在状态栏提示、记录日志。"
-			if not iniOk do msg += "\r\n\r\n⚠ 当前“加载启动脚本”是关闭的且自动恢复失败，\r\n请到 自定义 > 首选项 > MAXScript 手动勾选！"
-			if not regOk do msg += "\r\n\r\n⚠ 部分监听注册失败，详见 MAXScript 侦听器。"
-			messagebox msg title:"自启守护"
-		)
-		else
-		(
-			fnBsStartupGuardUnregister()
-			messagebox "已关闭自启守护！\r\n\r\n病毒关闭 Max 的“加载启动脚本”后，插件和杀毒将无法自启。                    " title:"自启守护"
-		)
-	)
 
 	on ckbSilent changed state do 
 	(
@@ -1031,4 +1267,4 @@ rollout rolBsCleanVirus  ("BsCleanVirus_v" + curVerBsCleanVirus)
 	)
 ------------------------------------------------------------------------------------------------------
 )
-Createdialog rolBsCleanVirus 390 305 fgcolor:myFgColor
+Createdialog rolBsCleanVirus 390 280 fgcolor:myFgColor
